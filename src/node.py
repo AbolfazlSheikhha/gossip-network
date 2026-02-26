@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from contextlib import suppress
 import hashlib
 import json
 import random
+import select
 import signal
+import sys
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -244,6 +247,9 @@ class NodeState:
     self_addr: str
     config: Config
     peer_store: PeerStore
+    seen_set: set[str]
+    message_store: dict[str, dict[str, Any]]
+    message_first_seen_ts_ms: dict[str, int]
 
 
 class NodeDatagramProtocol(asyncio.DatagramProtocol):
@@ -268,7 +274,6 @@ class NodeRuntime:
     PING_FAILURE_THRESHOLD = 3
 
     def __init__(self, config: Config) -> None:
-        random.seed(config.seed)
         node_id = str(uuid.uuid4())
         logger = JsonlLogger(node_id=node_id, port=config.port)
         peer_store = PeerStore(
@@ -282,12 +287,16 @@ class NodeRuntime:
             self_addr=config.self_addr,
             config=config,
             peer_store=peer_store,
+            seen_set=set(),
+            message_store={},
+            message_first_seen_ts_ms={},
         )
         self.message_ctx = MessageContext(
             node_id=node_id,
             self_addr=config.self_addr,
             default_ttl=config.ttl,
         )
+        self._rng = random.Random(config.seed)
         self.logger = logger
         self.dispatcher = MessageDispatcher(
             logger=self.logger,
@@ -297,11 +306,13 @@ class NodeRuntime:
                 "PEERS_LIST": self.handle_peers_list,
                 "PING": self.handle_ping,
                 "PONG": self.handle_pong,
+                "GOSSIP": self.handle_gossip,
             },
         )
         self.transport: asyncio.DatagramTransport | None = None
         self._stop_event = asyncio.Event()
         self._liveness_task: asyncio.Task[None] | None = None
+        self._stdin_task: asyncio.Task[None] | None = None
         self._pending_pings: dict[str, dict[str, int]] = {}
 
     def on_connection_made(self, transport: asyncio.DatagramTransport) -> None:
@@ -326,6 +337,8 @@ class NodeRuntime:
         self._bootstrap_join()
         if self._liveness_task is None:
             self._liveness_task = asyncio.create_task(self._liveness_loop(), name="liveness")
+        if self._stdin_task is None:
+            self._stdin_task = asyncio.create_task(self._stdin_loop(), name="stdin-loop")
 
     def on_connection_lost(self, exc: Exception | None) -> None:
         self.logger.log("node_transport_closed", reason=str(exc) if exc else "normal")
@@ -437,7 +450,7 @@ class NodeRuntime:
     def _create_pow(self, difficulty_k: int) -> dict[str, Any]:
         target = "0" * difficulty_k
         while True:
-            nonce = random.getrandbits(32)
+            nonce = self._rng.getrandbits(32)
             digest = hashlib.sha256(f"{nonce}{self.state.node_id}".encode("utf-8")).hexdigest()
             if digest.startswith(target):
                 return {
@@ -833,6 +846,231 @@ class NodeRuntime:
             failures=result["failures"],
         )
 
+    def _validate_gossip_payload(self, msg: dict[str, Any], peer: str) -> tuple[bool, dict[str, Any] | None]:
+        payload = msg.get("payload")
+        if not isinstance(payload, dict):
+            self.logger.log("gossip_invalid", peer=peer, msg_id=msg.get("msg_id"), reason="payload_not_object")
+            return False, None
+
+        topic = payload.get("topic")
+        if not isinstance(topic, str) or not topic.strip():
+            self.logger.log("gossip_invalid", peer=peer, msg_id=msg.get("msg_id"), reason="invalid_topic")
+            return False, None
+
+        origin_id = payload.get("origin_id")
+        if not isinstance(origin_id, str) or not origin_id.strip():
+            self.logger.log("gossip_invalid", peer=peer, msg_id=msg.get("msg_id"), reason="invalid_origin_id")
+            return False, None
+
+        origin_timestamp_ms = payload.get("origin_timestamp_ms")
+        if not isinstance(origin_timestamp_ms, int) or isinstance(origin_timestamp_ms, bool):
+            self.logger.log(
+                "gossip_invalid",
+                peer=peer,
+                msg_id=msg.get("msg_id"),
+                reason="invalid_origin_timestamp_ms",
+            )
+            return False, None
+
+        if "data" not in payload:
+            self.logger.log("gossip_invalid", peer=peer, msg_id=msg.get("msg_id"), reason="missing_data")
+            return False, None
+
+        ttl = msg.get("ttl")
+        if not isinstance(ttl, int) or isinstance(ttl, bool) or ttl < 0:
+            self.logger.log("gossip_invalid", peer=peer, msg_id=msg.get("msg_id"), reason="invalid_ttl")
+            return False, None
+
+        return True, payload
+
+    def _remember_gossip(self, msg_id: str, message: dict[str, Any], first_seen_ts_ms: int) -> None:
+        self.state.seen_set.add(msg_id)
+        self.state.message_store[msg_id] = copy.deepcopy(message)
+        self.state.message_first_seen_ts_ms[msg_id] = first_seen_ts_ms
+
+    def _fanout_targets(self, *, exclude_addrs: set[str]) -> tuple[list[str], int]:
+        candidates: list[str] = []
+        for peer in self.state.peer_store.snapshot():
+            if peer.addr in exclude_addrs:
+                continue
+            if self._parse_peer_tuple(peer.addr) is None:
+                continue
+            candidates.append(peer.addr)
+
+        if not candidates:
+            return [], 0
+
+        candidates = sorted(set(candidates))
+        candidate_count = len(candidates)
+        target_count = min(self.state.config.fanout, len(candidates))
+        if target_count <= 0:
+            return [], candidate_count
+        if target_count == len(candidates):
+            return candidates, candidate_count
+        return self._rng.sample(candidates, k=target_count), candidate_count
+
+    def _send_gossip_to_targets(
+        self,
+        *,
+        msg_id: str,
+        payload: dict[str, Any],
+        ttl: int,
+        targets: list[str],
+    ) -> int:
+        sent_count = 0
+        for target in targets:
+            target_tuple = self._parse_peer_tuple(target)
+            if target_tuple is None:
+                continue
+            forwarded = make_message("GOSSIP", payload=payload, ctx=self.message_ctx, ttl=ttl)
+            forwarded["msg_id"] = msg_id
+            if not self.send_message(target_tuple, forwarded):
+                continue
+            sent_count += 1
+            self.logger.log(
+                "gossip_forwarded",
+                msg_id=msg_id,
+                ttl=ttl,
+                peer=target,
+                peer_addr=target,
+            )
+        return sent_count
+
+    def _forward_received_gossip(self, *, message: dict[str, Any], from_peer_addr: str) -> None:
+        msg_id = str(message["msg_id"])
+        ttl_in = int(message["ttl"])
+        ttl_out = ttl_in - 1
+
+        if ttl_out <= 0:
+            self.logger.log(
+                "gossip_forward_decision",
+                msg_id=msg_id,
+                ttl_in=ttl_in,
+                ttl_out=ttl_out,
+                fanout=self.state.config.fanout,
+                candidate_count=0,
+                num_targets=0,
+                reason="ttl_exhausted",
+            )
+            return
+
+        exclude = {self.state.self_addr, from_peer_addr}
+        targets, candidate_count = self._fanout_targets(exclude_addrs=exclude)
+        self.logger.log(
+            "gossip_forward_decision",
+            msg_id=msg_id,
+            ttl_in=ttl_in,
+            ttl_out=ttl_out,
+            fanout=self.state.config.fanout,
+            candidate_count=candidate_count,
+            num_targets=len(targets),
+            reason="forward",
+        )
+        self._send_gossip_to_targets(msg_id=msg_id, payload=message["payload"], ttl=ttl_out, targets=targets)
+
+    def _originate_gossip(self, text: str) -> None:
+        origin_ts_ms = now_ms()
+        payload = {
+            "topic": "user",
+            "data": text,
+            "origin_id": self.state.node_id,
+            "origin_timestamp_ms": origin_ts_ms,
+        }
+        message = make_message("GOSSIP", payload=payload, ctx=self.message_ctx, ttl=self.state.config.ttl)
+        msg_id = str(message["msg_id"])
+        self._remember_gossip(msg_id, message, origin_ts_ms)
+        self.logger.log(
+            "gossip_originated",
+            msg_id=msg_id,
+            origin_ts_ms=origin_ts_ms,
+            ttl_initial=self.state.config.ttl,
+            text_len=len(text),
+        )
+
+        ttl_out = self.state.config.ttl
+        if ttl_out <= 0:
+            self.logger.log(
+                "gossip_forward_decision",
+                msg_id=msg_id,
+                ttl_in=ttl_out,
+                ttl_out=ttl_out,
+                fanout=self.state.config.fanout,
+                candidate_count=0,
+                num_targets=0,
+                reason="ttl_exhausted",
+            )
+            return
+
+        targets, candidate_count = self._fanout_targets(exclude_addrs={self.state.self_addr})
+        self.logger.log(
+            "gossip_forward_decision",
+            msg_id=msg_id,
+            ttl_in=ttl_out,
+            ttl_out=ttl_out,
+            fanout=self.state.config.fanout,
+            candidate_count=candidate_count,
+            num_targets=len(targets),
+            reason="origin_forward",
+        )
+        self._send_gossip_to_targets(msg_id=msg_id, payload=payload, ttl=ttl_out, targets=targets)
+
+    def handle_gossip(self, msg: dict[str, Any], peer: str) -> None:
+        is_valid, _payload = self._validate_gossip_payload(msg, peer)
+        if not is_valid:
+            return
+
+        sender_addr = str(msg.get("sender_addr"))
+        msg_id = str(msg.get("msg_id"))
+        ttl_in = int(msg["ttl"])
+        touched = self._touch_sender(msg, source="gossip", mark_hello_verified=False)
+
+        if msg_id in self.state.seen_set:
+            self.logger.log(
+                "gossip_duplicate_ignored",
+                msg_id=msg_id,
+                from_peer=sender_addr,
+                ttl_in=ttl_in,
+                action=touched["action"],
+            )
+            return
+
+        received_ts_ms = now_ms()
+        self._remember_gossip(msg_id, msg, received_ts_ms)
+        self.logger.log(
+            "gossip_first_seen",
+            msg_id=msg_id,
+            recv_ts_ms=received_ts_ms,
+            from_peer=sender_addr,
+            ttl_in=ttl_in,
+            action=touched["action"],
+        )
+        self._forward_received_gossip(message=msg, from_peer_addr=sender_addr)
+
+    def _read_stdin_line(self, timeout_s: float) -> str | None:
+        try:
+            ready, _unused_w, _unused_e = select.select([sys.stdin], [], [], timeout_s)
+        except (OSError, ValueError):
+            return None
+        if not ready:
+            return None
+        line = sys.stdin.readline()
+        return line
+
+    async def _stdin_loop(self) -> None:
+        self.logger.log("stdin_loop_started")
+        while not self._stop_event.is_set():
+            line = await asyncio.to_thread(self._read_stdin_line, 0.5)
+            if line is None:
+                continue
+            if line == "":
+                self.logger.log("stdin_eof")
+                return
+            text = line.strip()
+            if not text:
+                continue
+            self._originate_gossip(text)
+        self.logger.log("stdin_loop_stopped")
+
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
         transport, _protocol = await loop.create_datagram_endpoint(
@@ -844,6 +1082,11 @@ class NodeRuntime:
         try:
             await self._stop_event.wait()
         finally:
+            if self._stdin_task is not None:
+                self._stdin_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._stdin_task
+                self._stdin_task = None
             if self._liveness_task is not None:
                 self._liveness_task.cancel()
                 with suppress(asyncio.CancelledError):
