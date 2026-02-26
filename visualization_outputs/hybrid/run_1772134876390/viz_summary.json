@@ -1,0 +1,18 @@
+{
+  "mode": "hybrid",
+  "run_dir": "/Users/amirmohammad.gomar/CN_Project/visualization_outputs/hybrid/run_1772134876390",
+  "gif": "/Users/amirmohammad.gomar/CN_Project/visualization_outputs/hybrid/run_1772134876390/live_hybrid.gif",
+  "msg_id": "902b2d50-75fa-46fc-82cd-dea8767a8212",
+  "node_ports": [
+    42390,
+    42391,
+    42392,
+    42393,
+    42394,
+    42395,
+    42396,
+    42397,
+    42398,
+    42399
+  ]
+}
