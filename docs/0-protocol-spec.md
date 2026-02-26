@@ -68,7 +68,7 @@ Each node MUST keep the following in-memory state.
 - `peer_limit: int`
 - `ping_interval: int` (seconds)
 - `peer_timeout: int` (seconds)
-- `interval_pull: int` (seconds)
+- `pull_interval: int` (seconds)
 - `ids_max_ihave: int`
 - `k_pow: int`
 - `seed: int`
@@ -311,7 +311,7 @@ Advertise known message IDs (not full payloads) periodically.
 - `max_ids` MAY be included; if present SHOULD equal sender config `ids_max_ihave`.
 
 ### Send/Receive Rules
-- Every `interval_pull` seconds, node MUST send `IHAVE` to `min(fanout, active_peer_count)` random peers.
+- Every `pull_interval` seconds, node MUST send `IHAVE` to `min(fanout, active_peer_count)` random peers.
 - `ids` MUST be capped by `ids_max_ihave`.
 - Receiver MUST compare `ids` with `seen_set` and compute missing IDs.
 - If missing IDs are non-empty, receiver MUST send `IWANT`.
@@ -359,7 +359,7 @@ on_start:
   event loop starts:
     - receive UDP and handle messages
     - periodic ping task every ping_interval
-    - periodic pull task every interval_pull
+    - periodic pull task every pull_interval
 ```
 
 Bootstrap receive path:
@@ -490,7 +490,7 @@ These logs MUST be sufficient to compute Phase 3 convergence and message overhea
 ## Stage 1 Self-Review Checklist
 - [x] UDP transport and JSON format are mandated.
 - [x] Required configurable params defined: `fanout`, `ttl`, `peer_limit`, `ping_interval`, `peer_timeout`.
-- [x] Later mandatory params defined: `interval_pull`, `ids_max_ihave`, `k_pow`.
+- [x] Later mandatory params defined: `pull_interval`, `ids_max_ihave`, `k_pow`.
 - [x] Required message types fully specified: `HELLO`, `GET_PEERS`, `PEERS_LIST`, `GOSSIP`, `PING`, `PONG`.
 - [x] Hybrid `IHAVE`/`IWANT` specified.
 - [x] Set-Seen dedup and TTL stopping rule specified.

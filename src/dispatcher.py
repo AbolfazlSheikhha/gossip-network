@@ -7,7 +7,11 @@ from .messages import KNOWN_MSG_TYPES
 
 
 class MessageDispatcher:
-    def __init__(self, logger: JsonlLogger) -> None:
+    def __init__(
+        self,
+        logger: JsonlLogger,
+        handlers: dict[str, Callable[[dict[str, Any], str], None]] | None = None,
+    ) -> None:
         self.logger = logger
         self._handlers: dict[str, Callable[[dict[str, Any], str], None]] = {
             "HELLO": self.handle_hello,
@@ -19,6 +23,8 @@ class MessageDispatcher:
             "IHAVE": self.handle_ihave,
             "IWANT": self.handle_iwant,
         }
+        if handlers:
+            self._handlers.update(handlers)
 
     def dispatch(self, msg: dict[str, Any], peer: str) -> None:
         msg_type = str(msg.get("msg_type", ""))

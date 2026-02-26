@@ -58,7 +58,7 @@ class Config:
     ping_interval: int
     peer_timeout: int
     seed: int
-    interval_pull: int
+    pull_interval: int
     ids_max_ihave: int
     k_pow: int
     bind_host: str = "127.0.0.1"
@@ -114,8 +114,7 @@ def parse_config(argv: list[str] | None = None) -> Config:
         ping_interval=args.ping_interval,
         peer_timeout=args.peer_timeout,
         seed=args.seed,
-        interval_pull=args.interval_pull,
+        pull_interval=args.pull_interval,
         ids_max_ihave=args.ids_max_ihave,
         k_pow=args.k_pow,
     )
-

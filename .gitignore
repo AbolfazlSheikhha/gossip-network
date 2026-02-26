@@ -135,3 +135,6 @@ project-doc.md
 # Allow docs and scripts
 !docs/
 !scripts/
+
+# idea
+.idea/
