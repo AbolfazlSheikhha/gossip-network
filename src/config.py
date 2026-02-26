@@ -61,6 +61,7 @@ class Config:
     pull_interval: int
     ids_max_ihave: int
     k_pow: int
+    log_dir: str
     bind_host: str = "127.0.0.1"
 
     @property
@@ -90,6 +91,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pull-interval", type=_positive_int, default=2)
     parser.add_argument("--ids-max-ihave", type=_positive_int, default=32)
     parser.add_argument("--k-pow", type=_non_negative_int, default=0)
+    parser.add_argument("--log-dir", type=str, default="logs")
     return parser
 
 
@@ -117,4 +119,5 @@ def parse_config(argv: list[str] | None = None) -> Config:
         pull_interval=args.pull_interval,
         ids_max_ihave=args.ids_max_ihave,
         k_pow=args.k_pow,
+        log_dir=args.log_dir,
     )
