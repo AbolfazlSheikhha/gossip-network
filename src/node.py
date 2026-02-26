@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import hashlib
 import json
 import random
@@ -19,11 +20,12 @@ from .messages import MessageContext, make_message, now_ms, send_message, valida
 class PeerRecord:
     addr: str
     node_id: str | None
-    last_seen_ts_ms: int | None
+    last_seen_ts_ms: int
     consecutive_ping_failures: int = 0
-    last_ping_sent_ms: int | None = None
+    last_ping_ts_ms: int | None = None
     pending_ping_id: str | None = None
     pending_ping_seq: int | None = None
+    next_ping_seq: int = 1
     rtt_ms: int | None = None
     is_verified_hello: bool = False
     source: str = "peers_list"
@@ -56,12 +58,12 @@ class PeerStore:
         if addr == self._self_addr:
             return {"action": "ignored", "reason": "self", "evicted": None}
 
+        effective_last_seen = last_seen_ts_ms if last_seen_ts_ms is not None else now_ts_ms
         existing = self._peers.get(addr)
         if existing is not None:
             if node_id:
                 existing.node_id = node_id
-            if last_seen_ts_ms is not None:
-                existing.last_seen_ts_ms = last_seen_ts_ms
+            existing.last_seen_ts_ms = max(existing.last_seen_ts_ms, effective_last_seen)
             existing.source = source
             if mark_hello_verified:
                 existing.is_verified_hello = True
@@ -95,7 +97,7 @@ class PeerStore:
         record = PeerRecord(
             addr=addr,
             node_id=node_id,
-            last_seen_ts_ms=last_seen_ts_ms,
+            last_seen_ts_ms=effective_last_seen,
             is_verified_hello=mark_hello_verified,
             source=source,
         )
@@ -109,12 +111,69 @@ class PeerStore:
         )
         return {"action": "added", "reason": "new", "evicted": evicted_addr}
 
+    def get(self, addr: str) -> PeerRecord | None:
+        return self._peers.get(addr)
+
+    def snapshot(self) -> list[PeerRecord]:
+        return list(self._peers.values())
+
+    def register_ping_sent(self, addr: str, ping_id: str, seq: int, sent_ts_ms: int) -> bool:
+        peer = self._peers.get(addr)
+        if peer is None:
+            return False
+
+        peer.last_ping_ts_ms = sent_ts_ms
+        peer.pending_ping_id = ping_id
+        peer.pending_ping_seq = seq
+        return True
+
+    def mark_ping_timeout(self, addr: str, ping_id: str) -> tuple[bool, int]:
+        peer = self._peers.get(addr)
+        if peer is None:
+            return False, 0
+        if peer.pending_ping_id != ping_id:
+            return False, peer.consecutive_ping_failures
+
+        peer.pending_ping_id = None
+        peer.pending_ping_seq = None
+        peer.consecutive_ping_failures += 1
+        return True, peer.consecutive_ping_failures
+
+    def process_pong(
+        self,
+        *,
+        addr: str,
+        ping_id: str,
+        seq: int,
+        now_ts_ms: int,
+    ) -> dict[str, Any]:
+        peer = self._peers.get(addr)
+        if peer is None:
+            return {"status": "unknown_peer", "rtt_ms": None, "failures": 0}
+
+        peer.last_seen_ts_ms = now_ts_ms
+        if peer.pending_ping_id is None:
+            return {"status": "no_pending_ping", "rtt_ms": None, "failures": peer.consecutive_ping_failures}
+        if peer.pending_ping_id != ping_id:
+            return {"status": "ping_id_mismatch", "rtt_ms": None, "failures": peer.consecutive_ping_failures}
+        if peer.pending_ping_seq != seq:
+            return {"status": "seq_mismatch", "rtt_ms": None, "failures": peer.consecutive_ping_failures}
+
+        rtt_ms: int | None = None
+        if peer.last_ping_ts_ms is not None:
+            rtt_ms = max(0, now_ts_ms - peer.last_ping_ts_ms)
+
+        peer.pending_ping_id = None
+        peer.pending_ping_seq = None
+        peer.rtt_ms = rtt_ms
+        peer.consecutive_ping_failures = 0
+        return {"status": "matched", "rtt_ms": rtt_ms, "failures": 0}
+
     def _select_eviction_candidate(self, now_ts_ms: int) -> PeerRecord | None:
         candidate: PeerRecord | None = None
         candidate_score: tuple[int, int, str] | None = None
         for record in self._peers.values():
-            last_seen = record.last_seen_ts_ms if record.last_seen_ts_ms is not None else 0
-            staleness_ms = max(0, now_ts_ms - last_seen)
+            staleness_ms = max(0, now_ts_ms - record.last_seen_ts_ms)
             score = (record.consecutive_ping_failures, staleness_ms, record.addr)
             if candidate_score is None or score > candidate_score:
                 candidate_score = score
@@ -127,6 +186,43 @@ class PeerStore:
         if failures >= 3 or staleness_ms > self._peer_timeout_ms:
             return candidate
         return None
+
+    def evict_dead_peers(
+        self,
+        *,
+        now_ts_ms: int,
+        peer_timeout_ms: int,
+        ping_failure_threshold: int,
+    ) -> list[str]:
+        evicted: list[str] = []
+        for addr in sorted(self._peers):
+            peer = self._peers.get(addr)
+            if peer is None:
+                continue
+
+            last_seen_age_ms = max(0, now_ts_ms - peer.last_seen_ts_ms)
+            reason: str | None = None
+            if last_seen_age_ms > peer_timeout_ms:
+                reason = "peer_timeout"
+            elif peer.consecutive_ping_failures >= ping_failure_threshold:
+                reason = "ping_failures"
+
+            if reason is None:
+                continue
+
+            del self._peers[addr]
+            evicted.append(addr)
+            self._logger.log(
+                "peer_evict_dead",
+                peer=peer.addr,
+                peer_addr=peer.addr,
+                peer_id=peer.node_id,
+                reason=reason,
+                last_seen_age_ms=last_seen_age_ms,
+                failures=peer.consecutive_ping_failures,
+            )
+
+        return evicted
 
     def list_for_peers_list(self, *, limit: int, exclude_addrs: set[str]) -> list[dict[str, str]]:
         peers: list[dict[str, str]] = []
@@ -169,6 +265,8 @@ class NodeDatagramProtocol(asyncio.DatagramProtocol):
 
 
 class NodeRuntime:
+    PING_FAILURE_THRESHOLD = 3
+
     def __init__(self, config: Config) -> None:
         random.seed(config.seed)
         node_id = str(uuid.uuid4())
@@ -203,6 +301,8 @@ class NodeRuntime:
         )
         self.transport: asyncio.DatagramTransport | None = None
         self._stop_event = asyncio.Event()
+        self._liveness_task: asyncio.Task[None] | None = None
+        self._pending_pings: dict[str, dict[str, int]] = {}
 
     def on_connection_made(self, transport: asyncio.DatagramTransport) -> None:
         self.transport = transport
@@ -224,6 +324,8 @@ class NodeRuntime:
             log_path=str(self.logger.path),
         )
         self._bootstrap_join()
+        if self._liveness_task is None:
+            self._liveness_task = asyncio.create_task(self._liveness_loop(), name="liveness")
 
     def on_connection_lost(self, exc: Exception | None) -> None:
         self.logger.log("node_transport_closed", reason=str(exc) if exc else "normal")
@@ -353,14 +455,117 @@ class NodeRuntime:
         return host, port
 
     def _touch_sender(self, msg: dict[str, Any], source: str, mark_hello_verified: bool) -> dict[str, str | None]:
+        touched_ts_ms = now_ms()
         return self.state.peer_store.upsert(
             addr=str(msg.get("sender_addr")),
             node_id=str(msg.get("sender_id")),
-            last_seen_ts_ms=now_ms(),
+            last_seen_ts_ms=touched_ts_ms,
             source=source,
             mark_hello_verified=mark_hello_verified,
-            now_ts_ms=now_ms(),
+            now_ts_ms=touched_ts_ms,
         )
+
+    def _cleanup_pending_pings(self, now_ts_ms: int) -> None:
+        ttl_ms = self.state.config.peer_timeout * 1000
+        for peer_addr in list(self._pending_pings):
+            ping_map = self._pending_pings[peer_addr]
+            for ping_id, sent_ts_ms in list(ping_map.items()):
+                if now_ts_ms - sent_ts_ms > ttl_ms:
+                    del ping_map[ping_id]
+            if not ping_map:
+                del self._pending_pings[peer_addr]
+
+    def _process_ping_timeouts(self, now_ts_ms: int) -> None:
+        ping_interval_ms = self.state.config.ping_interval * 1000
+        for peer in self.state.peer_store.snapshot():
+            if not peer.pending_ping_id or peer.last_ping_ts_ms is None:
+                continue
+
+            if now_ts_ms - peer.last_ping_ts_ms < ping_interval_ms:
+                continue
+
+            pending_ping_id = peer.pending_ping_id
+            timed_out, failures = self.state.peer_store.mark_ping_timeout(peer.addr, pending_ping_id)
+            if not timed_out:
+                continue
+
+            peer_pending = self._pending_pings.get(peer.addr)
+            if peer_pending is not None:
+                peer_pending.pop(pending_ping_id, None)
+                if not peer_pending:
+                    del self._pending_pings[peer.addr]
+
+            self.logger.log(
+                "ping_timeout",
+                peer=peer.addr,
+                peer_addr=peer.addr,
+                peer_id=peer.node_id,
+                ping_id=pending_ping_id,
+                failures=failures,
+            )
+
+    def _send_ping(self, peer: PeerRecord, now_ts_ms: int) -> None:
+        if peer.pending_ping_id is not None:
+            return
+
+        peer_tuple = self._parse_peer_tuple(peer.addr)
+        if peer_tuple is None:
+            return
+
+        ping_id = str(uuid.uuid4())
+        seq = peer.next_ping_seq
+        peer.next_ping_seq += 1
+        ping_msg = make_message("PING", {"ping_id": ping_id, "seq": seq}, self.message_ctx)
+        if not self.send_message(peer_tuple, ping_msg):
+            return
+
+        if not self.state.peer_store.register_ping_sent(peer.addr, ping_id, seq, now_ts_ms):
+            return
+
+        peer_pending = self._pending_pings.setdefault(peer.addr, {})
+        peer_pending[ping_id] = now_ts_ms
+        self._cleanup_pending_pings(now_ts_ms)
+        self.logger.log(
+            "ping_sent",
+            peer=peer.addr,
+            peer_addr=peer.addr,
+            peer_id=peer.node_id,
+            msg_id=ping_msg["msg_id"],
+            ping_id=ping_id,
+            seq=seq,
+        )
+
+    async def _liveness_loop(self) -> None:
+        interval_s = self.state.config.ping_interval
+        peer_timeout_ms = self.state.config.peer_timeout * 1000
+        self.logger.log(
+            "liveness_started",
+            ping_interval_s=interval_s,
+            peer_timeout_ms=peer_timeout_ms,
+            failure_threshold=self.PING_FAILURE_THRESHOLD,
+        )
+
+        while not self._stop_event.is_set():
+            cycle_start_ms = now_ms()
+            self._process_ping_timeouts(cycle_start_ms)
+            evicted = self.state.peer_store.evict_dead_peers(
+                now_ts_ms=cycle_start_ms,
+                peer_timeout_ms=peer_timeout_ms,
+                ping_failure_threshold=self.PING_FAILURE_THRESHOLD,
+            )
+            for addr in evicted:
+                self._pending_pings.pop(addr, None)
+
+            for peer in self.state.peer_store.snapshot():
+                self._send_ping(peer, cycle_start_ms)
+
+            self._cleanup_pending_pings(now_ms())
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=interval_s)
+            except asyncio.TimeoutError:
+                continue
+
+        self.logger.log("liveness_stopped")
 
     def _validate_hello(self, msg: dict[str, Any]) -> tuple[bool, str]:
         payload = msg.get("payload")
@@ -446,7 +651,7 @@ class NodeRuntime:
                 return
             requested_max = max_peers
 
-        self._touch_sender(msg, source="hello", mark_hello_verified=False)
+        self._touch_sender(msg, source="get_peers", mark_hello_verified=False)
 
         limit = min(requested_max or self.state.config.peer_limit, self.state.config.peer_limit)
         exclude = {self.state.self_addr, str(msg.get("sender_addr"))}
@@ -478,7 +683,7 @@ class NodeRuntime:
             self.logger.log("peers_list_invalid", peer=peer, msg_id=msg.get("msg_id"), reason="invalid_peers_field")
             return
 
-        self._touch_sender(msg, source="hello", mark_hello_verified=False)
+        self._touch_sender(msg, source="peers_list", mark_hello_verified=False)
 
         added = 0
         updated = 0
@@ -553,14 +758,36 @@ class NodeRuntime:
             self.logger.log("ping_invalid", peer=peer, msg_id=msg.get("msg_id"), reason="invalid_seq")
             return
 
-        self._touch_sender(msg, source="hello", mark_hello_verified=False)
-        peer_tuple = self._parse_peer_tuple(peer)
+        sender_addr = str(msg.get("sender_addr"))
+        sender_id = msg.get("sender_id")
+        touched = self._touch_sender(msg, source="ping", mark_hello_verified=False)
+        self.logger.log(
+            "ping_received",
+            peer=sender_addr,
+            peer_addr=sender_addr,
+            peer_id=sender_id if isinstance(sender_id, str) else None,
+            msg_id=msg.get("msg_id"),
+            ping_id=ping_id,
+            seq=seq,
+            action=touched["action"],
+        )
+
+        peer_tuple = self._parse_peer_tuple(sender_addr)
         if peer_tuple is None:
             self.logger.log("send_error", peer=peer, msg_type="PONG", reason="invalid_ping_sender_peer")
             return
 
         pong_msg = make_message("PONG", {"ping_id": ping_id, "seq": seq}, self.message_ctx)
-        self.send_message(peer_tuple, pong_msg)
+        if self.send_message(peer_tuple, pong_msg):
+            self.logger.log(
+                "pong_sent",
+                peer=sender_addr,
+                peer_addr=sender_addr,
+                peer_id=sender_id if isinstance(sender_id, str) else None,
+                msg_id=pong_msg["msg_id"],
+                ping_id=ping_id,
+                seq=seq,
+            )
 
     def handle_pong(self, msg: dict[str, Any], peer: str) -> None:
         payload = msg.get("payload")
@@ -577,7 +804,34 @@ class NodeRuntime:
             self.logger.log("pong_invalid", peer=peer, msg_id=msg.get("msg_id"), reason="invalid_seq")
             return
 
-        self._touch_sender(msg, source="hello", mark_hello_verified=False)
+        sender_addr = str(msg.get("sender_addr"))
+        sender_id = msg.get("sender_id")
+        self._touch_sender(msg, source="pong", mark_hello_verified=False)
+        result = self.state.peer_store.process_pong(
+            addr=sender_addr,
+            ping_id=ping_id,
+            seq=seq,
+            now_ts_ms=now_ms(),
+        )
+
+        peer_pending = self._pending_pings.get(sender_addr)
+        if peer_pending is not None:
+            peer_pending.pop(ping_id, None)
+            if not peer_pending:
+                del self._pending_pings[sender_addr]
+
+        self.logger.log(
+            "pong_received",
+            peer=sender_addr,
+            peer_addr=sender_addr,
+            peer_id=sender_id if isinstance(sender_id, str) else None,
+            msg_id=msg.get("msg_id"),
+            ping_id=ping_id,
+            seq=seq,
+            status=result["status"],
+            rtt_ms=result["rtt_ms"],
+            failures=result["failures"],
+        )
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -590,6 +844,11 @@ class NodeRuntime:
         try:
             await self._stop_event.wait()
         finally:
+            if self._liveness_task is not None:
+                self._liveness_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._liveness_task
+                self._liveness_task = None
             if self.transport is not None:
                 self.transport.close()
                 self.transport = None
