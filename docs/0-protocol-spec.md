@@ -431,7 +431,7 @@ Node executable MUST support:
 - `--seed <int>`: random seed for reproducibility.
 
 Later-mandatory, defined now:
-- `--interval-pull <seconds>`: interval for periodic `IHAVE`.
+- `--pull-interval <seconds>`: interval for periodic `IHAVE`.
 - `--ids-max-ihave <int>`: max IDs carried by one `IHAVE`.
 - `--k-pow <int>`: PoW difficulty (leading hex zeros required in HELLO hash).
 
