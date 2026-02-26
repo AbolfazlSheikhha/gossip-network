@@ -12,19 +12,15 @@ def now_ms() -> int:
 
 
 class JsonlLogger:
-    def __init__(self, node_id: str, port: int, log_dir: str = "logs", log_file: str | None = None) -> None:
+    def __init__(self, node_id: str, port: int, log_dir: str = "logs") -> None:
         self.node_id = node_id
         self._closed = False
         self._lock = Lock()
 
-        if log_file:
-            self.path = Path(log_file)
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-        else:
-            directory = Path(log_dir)
-            directory.mkdir(parents=True, exist_ok=True)
-            filename = f"node-{port}-{now_ms()}-{node_id[:8]}.jsonl"
-            self.path = directory / filename
+        directory = Path(log_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        filename = f"node-{port}-{now_ms()}-{node_id[:8]}.jsonl"
+        self.path = directory / filename
         self._fp = self.path.open("a", encoding="utf-8", buffering=1)
 
     def log(self, event: str, **fields: Any) -> None:
@@ -54,3 +50,4 @@ class JsonlLogger:
             self._fp.flush()
             self._fp.close()
             self._closed = True
+

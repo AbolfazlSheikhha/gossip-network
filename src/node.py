@@ -275,7 +275,7 @@ class NodeRuntime:
 
     def __init__(self, config: Config) -> None:
         node_id = str(uuid.uuid4())
-        logger = JsonlLogger(node_id=node_id, port=config.port, log_file=config.log_file)
+        logger = JsonlLogger(node_id=node_id, port=config.port)
         peer_store = PeerStore(
             self_addr=config.self_addr,
             peer_limit=config.peer_limit,
